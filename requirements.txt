@@ -1,0 +1,164 @@
+
+import json
+import os
+import tempfile
+
+import requests
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from paddleocr import PaddleOCR
+
+app = FastAPI(title="Invoice AI")
+
+# Initialize OCR once, not for every request.
+ocr = PaddleOCR(use_angle_cls=True, lang="en")
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+MODEL = "qwen2.5:3b"
+
+
+def extract_text(image_path: str) -> str:
+    """Read text from an invoice image."""
+    result = ocr.ocr(image_path, cls=True)
+
+    lines = []
+    if result and result[0]:
+        for item in result[0]:
+            text = item[1][0]
+            lines.append(text)
+
+    return "\n".join(lines)
+
+
+def extract_invoice_fields(raw_text: str) -> dict:
+    """Convert OCR text into structured invoice data."""
+    prompt = f"""
+Extract information from this invoice.
+
+Return a JSON object with these fields:
+- invoice_number
+- invoice_date
+- vendor
+- invoice_type: purchase, sales, or unknown
+- currency
+- items: array of objects containing name, quantity,
+  unit_price, and amount
+- subtotal
+- tax
+- total
+
+Use null for missing values. Do not invent information.
+Do not assume the invoice total is correct.
+
+OCR text:
+{raw_text}
+"""
+
+    response = requests.post(
+        OLLAMA_URL,
+        json={
+            "model": MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract invoice data. "
+                        "Return only valid JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "format": "json",
+            "stream": False,
+        },
+        timeout=180,
+    )
+    response.raise_for_status()
+
+    content = response.json()["message"]["content"]
+    return json.loads(content)
+
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "service": "Invoice AI"}
+
+
+@app.post("/extract-invoice")
+async def extract_invoice(
+    file: UploadFile = File(...)
+):
+    if file.content_type not in {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a JPG, PNG, or WebP image.",
+        )
+
+    image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded image is empty.",
+        )
+
+    # Limit upload size to 10 MB.
+    if len(image_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Image must be smaller than 10 MB.",
+        )
+
+    suffix = (
+        ".png"
+        if file.content_type == "image/png"
+        else ".webp"
+        if file.content_type == "image/webp"
+        else ".jpg"
+    )
+
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False
+        ) as temp:
+            temp.write(image_bytes)
+            temp_path = temp.name
+
+        raw_text = extract_text(temp_path)
+
+        if not raw_text.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="No readable text found in the image.",
+            )
+
+        invoice = extract_invoice_fields(raw_text)
+
+        return {
+            "ocr_text": raw_text,
+            "invoice": invoice,
+        }
+
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not reach Ollama. "
+                "Check that Ollama is running."
+            ),
+        ) from exc
+
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="The model returned invalid invoice JSON.",
+        ) from exc
+
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
